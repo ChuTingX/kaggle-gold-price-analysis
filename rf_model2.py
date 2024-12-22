@@ -1,139 +1,98 @@
 import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import KFold, RandomizedSearchCV
+from sklearn.model_selection import KFold, GridSearchCV
 from sklearn.metrics import mean_squared_error, make_scorer
 
-########################################
-# Step 1: Data Loading and Preparation
-########################################
-
-# Load the original dataset
+# 1. Load Data
 df = pd.read_csv("FINAL_USO.csv", parse_dates=["Date"], index_col="Date")
 
 # Remove trend columns
 trend_columns = [col for col in df.columns if col.endswith('_Trend')]
-df = df.drop(columns=trend_columns, errors='ignore')
+df.drop(columns=trend_columns, errors='ignore', inplace=True)
 
-# Check if 'Adj Close' exists
+# Check for 'Adj Close'
 if 'Adj Close' not in df.columns:
-    raise ValueError("Expected 'Adj Close' column not found in the dataset.")
+    raise ValueError("No 'Adj Close' column found.")
 
-# Add rolling features for Adj Close
+# Add rolling averages
 df['Adj_Close_7d'] = df['Adj Close'].rolling(window=7, min_periods=7).mean()
 df['Adj_Close_30d'] = df['Adj Close'].rolling(window=30, min_periods=30).mean()
+df.dropna(inplace=True)
 
-# Drop rows with NaN caused by rolling
-df = df.dropna()
-
-########################################
-# Step 2: Creating Lagged Features
-########################################
-
-# Define base predictors including new rolling features
+# 2. Create Lagged Features
 base_predictors = [
     'Adj Close', 'SP_close', 'DJ_close', 'USDI_Price', 'EU_Price', 'GDX_Close',
-    'SF_Price', 'PLT_Price', 'PLD_Price', 'RHO_PRICE', 'USO_Close', 'OF_Price', 'OS_Price',
-    'Adj_Close_7d', 'Adj_Close_30d'
+    'SF_Price', 'PLT_Price', 'PLD_Price', 'RHO_PRICE', 'USO_Close',
+    'OF_Price', 'OS_Price', 'Adj_Close_7d', 'Adj_Close_30d'
 ]
-
-# Filter to ensure they exist in df
 base_predictors = [p for p in base_predictors if p in df.columns]
 
-# Create lagged_df
 lagged_df = pd.DataFrame(index=df.index)
-lagged_df['Adj Close'] = df['Adj Close']  # current day target
-
+lagged_df['Adj Close'] = df['Adj Close']
 for var in base_predictors:
     lagged_df[var + '_prev'] = df[var].shift(1)
-
-# Drop the first row with missing previous day data
 lagged_df.dropna(inplace=True)
 
-########################################
-# Step 3: Baseline Evaluation
-########################################
-
+# 3. Baseline MSE (Prev Day as Prediction)
 target = 'Adj Close'
-predictors = [col for col in lagged_df.columns if col.endswith('_prev')]
-
+predictors = [c for c in lagged_df.columns if c.endswith('_prev')]
 X = lagged_df[predictors].values
 y = lagged_df[target].values
 
 kf = KFold(n_splits=10, shuffle=True, random_state=42)
-baseline_predictor = 'Adj Close_prev'
-X_baseline = lagged_df[baseline_predictor].values
+X_baseline = lagged_df['Adj Close_prev'].values
 
-baseline_rmse_scores = []
-for train_index, test_index in kf.split(X_baseline):
-    y_test = y[test_index]
-    y_pred_baseline = X_baseline[test_index]
-    rmse = np.sqrt(mean_squared_error(y_test, y_pred_baseline))
-    baseline_rmse_scores.append(rmse)
+baseline_mse_scores = []
+for train_idx, test_idx in kf.split(X_baseline):
+    mse = mean_squared_error(y[test_idx], X_baseline[test_idx])
+    baseline_mse_scores.append(mse)
+mean_baseline_mse = np.mean(baseline_mse_scores)
+print(f"Baseline MSE: {mean_baseline_mse:.4f}")
 
-mean_baseline_rmse = np.mean(baseline_rmse_scores)
-print(f"Baseline (Previous Day Adj Close) Mean RMSE: {mean_baseline_rmse:.4f}")
+# 4. Random Forest Tuning via GridSearchCV
+def mse_score(y_true, y_pred):
+    return mean_squared_error(y_true, y_pred)
 
-########################################
-# Step 4: Random Forest Tuning and Evaluation
-########################################
+mse_scorer = make_scorer(mse_score, greater_is_better=False)
 
-def rmse_score(y_true, y_pred):
-    return np.sqrt(mean_squared_error(y_true, y_pred))
-
-rmse_scorer = make_scorer(rmse_score, greater_is_better=False)
-
-# Parameter space for tuning
-param_dist = {
+param_grid = {
     'n_estimators': [100, 200, 300, 500],
-    'max_depth': [None, 5, 10, 20],
-    'max_features': ['None', 'sqrt', 'log2'],
+    'max_depth': [None, 15, 25, 35],
+    'max_features': ['sqrt', 0.5, 1.0],
     'min_samples_split': [2, 5, 10],
-    'min_samples_leaf': [1, 2, 5]
+    'min_samples_leaf': [1, 2],
+    'bootstrap': [True]
 }
 
 rf = RandomForestRegressor(random_state=42)
 
-random_search = RandomizedSearchCV(
-    estimator=rf,
-    param_distributions=param_dist,
-    n_iter=30,  # more iterations to find better params
-    scoring=rmse_scorer,
+grid_search = GridSearchCV(
+    rf,
+    param_grid=param_grid,
+    scoring=mse_scorer,
     cv=kf,
-    random_state=42,
-    n_jobs=-1
+    n_jobs=-1,
+    verbose=1
 )
+grid_search.fit(X, y)
 
-random_search.fit(X, y)
+best_mse = abs(grid_search.best_score_)
+best_params = grid_search.best_params_
+print("\nBest parameters:", best_params)
+print(f"Best MSE (GridSearchCV): {best_mse:.4f}")
 
-best_rmse = abs(random_search.best_score_)
-best_params = random_search.best_params_
+best_rf = grid_search.best_estimator_
 
-print("\nBest parameters found:", best_params)
-print(f"Best RMSE from RandomizedSearchCV (CV estimate): {best_rmse:.4f}")
+rf_mse_scores = []
+for train_idx, test_idx in kf.split(X):
+    best_rf.fit(X[train_idx], y[train_idx])
+    preds = best_rf.predict(X[test_idx])
+    rf_mse_scores.append(mean_squared_error(y[test_idx], preds))
 
-best_rf = random_search.best_estimator_
+mean_rf_mse = np.mean(rf_mse_scores)
+std_rf_mse = np.std(rf_mse_scores)
+print("\nTuned RF 10-Fold MSE:", rf_mse_scores)
+print(f"Tuned RF Mean MSE: {mean_rf_mse:.4f} ± {std_rf_mse:.4f}")
 
-# Evaluate tuned RF with 10-fold CV again
-rmse_scores = []
-for train_index, test_index in kf.split(X):
-    X_train, X_test = X[train_index], X[test_index]
-    y_train, y_test = y[train_index], y[test_index]
-
-    best_rf.fit(X_train, y_train)
-    y_pred = best_rf.predict(X_test)
-    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-    rmse_scores.append(rmse)
-
-mean_rf_rmse = np.mean(rmse_scores)
-std_rf_rmse = np.std(rmse_scores)
-
-print("\nTuned Random Forest 10-Fold CV RMSE Scores:", rmse_scores)
-print(f"Tuned Random Forest Mean RMSE: {mean_rf_rmse:.4f} ± {std_rf_rmse:.4f}")
-
-# Compare to baseline
-print(f"\nBaseline Mean RMSE: {mean_baseline_rmse:.4f}")
-if mean_rf_rmse < mean_baseline_rmse:
-    print("The tuned Random Forest model now outperforms the baseline!")
-else:
-    print("The baseline still outperforms the tuned Random Forest model.")
+print("COMPLETE")
